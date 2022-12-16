@@ -11,3 +11,4 @@ fn main() {
     rdr.write_vu64::<Binary>(88748464645454).unwrap();
     assert!(rdr.get_ref().eq(&vec![206, 202, 214, 229, 245, 150, 20]));
 }
+

@@ -7,9 +7,24 @@ pub const MAX_VARINT_LEN16: usize = 3;
 pub const MAX_VARINT_LEN32: usize = 5;
 pub const MAX_VARINT_LEN64: usize = 10;
 
+pub const CONTINUATION_BIT: u8 = 1 << 7;
+
+#[inline]
+pub fn low_bits_of_byte(byte: u8) -> u8 {
+    byte & !CONTINUATION_BIT
+}
+
+#[inline]
+pub fn low_bits_of_u64(val: u64) -> u8 {
+    let byte = val & (std::u8::MAX as u64);
+    low_bits_of_byte(byte as u8)
+}
+
 pub trait WriteBinary {
     fn put_vu64(buf: &mut [u8], x: u64) -> usize;
     fn put_vi64(buf: &mut [u8], x: i64) -> usize;
+    fn put_leb128_u64(buf: &mut [u8], x: u64) -> usize;
+    fn put_leb128_i64(buf: &mut [u8], x: i64) -> usize;
 }
 
 pub trait ReadBinary {
@@ -17,6 +32,8 @@ pub trait ReadBinary {
     fn vi64(buf: &[u8]) -> (i64, i32);
     fn read_vu64<T: ReadU8 + ?Sized>(t: &mut T) -> (u64, i32);
     fn read_vi64<T: ReadU8 + ?Sized>(t: &mut T) -> (i64, i32);
+    fn read_leb128_i64<T: ReadU8 + ?Sized>(t: &mut T) -> Result<i64>;
+    fn read_leb128_u64<T: ReadU8 + ?Sized>(t: &mut T) -> Result<u64>;
 }
 
 pub enum Binary {}
@@ -45,6 +62,43 @@ impl WriteBinary for Binary {
             ux = !ux;
         }
         Self::put_vu64(buf, ux)
+    }
+
+    #[inline]
+    fn put_leb128_u64(buf: &mut [u8], mut x: u64) -> usize {
+        let mut i = 0;
+        while x > 0 {
+            let mut byte = low_bits_of_u64(x);
+            x >>= 7;
+            if x != 0 {
+                byte |= CONTINUATION_BIT;
+            }
+            buf[i] = byte;
+            i += 1;
+        }
+        i
+    }
+
+    #[inline]
+    fn put_leb128_i64(buf: &mut [u8], mut x: i64) -> usize {
+        let mut i = 0;
+        loop {
+            let mut byte = x as u8;
+            x >>= 6;
+            let done = x == 0 || x == -1;
+            if done {
+                byte &= !CONTINUATION_BIT;
+            } else {
+                x >>= 1;
+                byte |= CONTINUATION_BIT;
+            }
+            buf[i] = byte;
+            i += 1;
+            if done {
+                break;
+            }
+        }
+        i
     }
 }
 
@@ -112,6 +166,59 @@ impl ReadBinary for Binary {
         }
         (x, n)
     }
+
+    #[inline]
+    fn read_leb128_i64<T: ReadU8 + ?Sized>(t: &mut T) -> Result<i64> {
+        let mut result: i64 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = t.read_u8()?;
+            result |= i64::from(byte & 0x7F) << shift;
+            if shift >= 57 {
+                let continuation_bit = (byte & 0x80) != 0;
+                let sign_and_unused_bit = ((byte << 1) as i8) >> (64 - shift);
+                if continuation_bit || (sign_and_unused_bit != 0 && sign_and_unused_bit != -1) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "Invalid leb128 i64",
+                    ));
+                }
+                return Ok(result);
+            }
+            shift += 7;
+            if (byte & 0x80) == 0 {
+                break;
+            }
+        }
+        let ashift = 64 - shift;
+        Ok((result << ashift) >> ashift)
+    }
+
+    #[inline]
+    fn read_leb128_u64<T: ReadU8 + ?Sized>(t: &mut T) -> Result<u64> {
+        let byte = u64::from(t.read_u8()?);
+        if (byte & 0x80) == 0 {
+            return Ok(byte);
+        }
+        let mut result = byte & 0x7F;
+        let mut shift = 7;
+        loop {
+            let byte = u64::from(t.read_u8()?);
+            result |= (byte & 0x7F) << shift;
+            if shift >= 57 && (byte >> (64 - shift)) != 0 {
+                // The continuation bit or unused bits are set.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Invalid leb128 u64",
+                ));
+            }
+            shift += 7;
+            if (byte & 0x80) == 0 {
+                break;
+            }
+        }
+        Ok(result)
+    }
 }
 
 pub trait WriteBytesVarExt: io::Write {
@@ -130,15 +237,30 @@ pub trait WriteBytesVarExt: io::Write {
         self.write_all(&buf[..i])?;
         Ok(i)
     }
+
+    #[inline]
+    fn write_leb128_u64<T: WriteBinary>(&mut self, x: u64) -> Result<usize> {
+        let mut buf = [0u8; MAX_VARINT_LEN64];
+        let i = T::put_leb128_u64(&mut buf, x);
+        self.write_all(&buf[..i])?;
+        Ok(i)
+    }
+
+    #[inline]
+    fn write_leb128_i64<T: WriteBinary>(&mut self, x: i64) -> Result<usize> {
+        let mut buf = [0u8; MAX_VARINT_LEN64];
+        let i = T::put_leb128_i64(&mut buf, x);
+        self.write_all(&buf[..i])?;
+        Ok(i)
+    }
 }
 
-pub trait ReadU8: io::Read {
-    #[inline]
-    fn read_u8(&mut self) -> Result<u8> {
-        let mut buf = [0; 1];
-        self.read_exact(&mut buf)?;
-        Ok(buf[0])
-    }
+pub trait ReadU8 {
+    fn read_u8(&mut self) -> Result<u8>;
+}
+
+pub trait ReadU8Ext {
+    fn read_u8(&mut self) -> Result<u8>;
 }
 
 pub trait ReadBytesVarExt: ReadU8 {
@@ -147,12 +269,30 @@ pub trait ReadBytesVarExt: ReadU8 {
         T::read_vu64(self)
     }
 
+    #[inline]
     fn read_vi64<T: ReadBinary>(&mut self) -> (i64, i32) {
         T::read_vi64(self)
     }
+
+    #[inline]
+    fn read_led128_u64<T: ReadBinary>(&mut self) -> Result<u64> {
+        T::read_leb128_u64(self)
+    }
+
+    #[inline]
+    fn read_led128_i64<T: ReadBinary>(&mut self) -> Result<i64> {
+        T::read_leb128_i64(self)
+    }
 }
 
-impl<R: io::Read + ?Sized> ReadU8 for R {}
+impl<R: io::Read + ?Sized> ReadU8 for R {
+    #[inline]
+    fn read_u8(&mut self) -> Result<u8> {
+        let mut buf = [0; 1];
+        self.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+}
 
 impl<W: io::Write + ?Sized> WriteBytesVarExt for W {}
 
@@ -278,6 +418,30 @@ mod tests {
             rdr.write_vi64::<Binary>(x).unwrap();
             rdr.set_position(0);
             let (v, _) = rdr.read_vi64::<Binary>();
+            rdr.set_position(0);
+            assert!(x == v);
+        }
+    }
+
+    #[test]
+    fn test_read_led128_u64() {
+        let mut rdr = Cursor::new(vec![0u8; MAX_VARINT_LEN64]);
+        for x in uvar_test {
+            rdr.write_leb128_u64::<Binary>(x).unwrap();
+            rdr.set_position(0);
+            let v = rdr.read_led128_u64::<Binary>().unwrap();
+            rdr.set_position(0);
+            assert!(x == v);
+        }
+    }
+
+    #[test]
+    fn test_read_led128_i64() {
+        let mut rdr = Cursor::new(vec![0u8; MAX_VARINT_LEN64]);
+        for x in ivar_test {
+            rdr.write_leb128_i64::<Binary>(x).unwrap();
+            rdr.set_position(0);
+            let v = rdr.read_led128_i64::<Binary>().unwrap();
             rdr.set_position(0);
             assert!(x == v);
         }

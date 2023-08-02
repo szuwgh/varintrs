@@ -2,6 +2,28 @@ use std::io;
 use std::io::Cursor;
 use std::io::Result;
 
+// 1 -> 127
+// 2 -> 16383
+// 3 -> 2097151
+// 4 -> 10485760 10M
+
+#[macro_export]
+macro_rules! vint_size {
+    ($x:expr) => {
+        if 0 <= $x && $x <= 127 {
+            1
+        } else if $x <= 16383 {
+            2
+        } else if $x <= 2097151 {
+            3
+        } else if $x <= 10485760 {
+            4
+        } else {
+            0
+        }
+    };
+}
+
 // MaxVarintLenN is the maximum length of a varint-encoded N-bit integer.
 pub const MAX_VARINT_LEN16: usize = 3;
 pub const MAX_VARINT_LEN32: usize = 5;
@@ -429,6 +451,7 @@ mod tests {
         for x in uvar_test {
             rdr.write_leb128_u64::<Binary>(x).unwrap();
             rdr.set_position(0);
+            println!("{}:{:?}", x, rdr.get_ref());
             let v = rdr.read_led128_u64::<Binary>().unwrap();
             rdr.set_position(0);
             assert!(x == v);
@@ -445,5 +468,12 @@ mod tests {
             rdr.set_position(0);
             assert!(x == v);
         }
+    }
+
+    use std::collections::HashMap;
+    #[test]
+    fn test_size_vint_u64() {
+        let i = vint_size!(5874698);
+        println!("{}", i);
     }
 }
